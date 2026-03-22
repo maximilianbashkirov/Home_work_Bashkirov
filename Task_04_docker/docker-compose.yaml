@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  fastapi:
+    build: ./backend
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./backend/data.csv:/app/data.csv  
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  streamlit:
+    build: ./frontend
+    ports:
+      - "8889:8889"
+    depends_on:
+      - fastapi
+    environment:
+      - API_URL=http://fastapi:8888
+    restart: unless-stopped
