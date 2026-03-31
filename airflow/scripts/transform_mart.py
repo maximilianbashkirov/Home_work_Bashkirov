@@ -30,6 +30,7 @@ def get_spark_session():
 
 
 def build_orders_mart(spark):
+    """Построение витрины заказов с исправленной логикой скидок"""
 
     jdbc_url = f"jdbc:postgresql://{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
     properties = {
@@ -38,6 +39,7 @@ def build_orders_mart(spark):
         "driver": "org.postgresql.Driver"
     }
 
+    # Чтение данных
     orders_df = spark.read.jdbc(url=jdbc_url, table="fact_orders", properties=properties)
     order_items_df = spark.read.jdbc(url=jdbc_url, table="fact_order_items", properties=properties)
     users_df = spark.read.jdbc(url=jdbc_url, table="dim_users", properties=properties)
@@ -45,6 +47,7 @@ def build_orders_mart(spark):
     stores_df = spark.read.jdbc(url=jdbc_url, table="dim_stores", properties=properties)
     assignments_df = spark.read.jdbc(url=jdbc_url, table="fact_delivery_assignments", properties=properties)
 
+    # Обогащение заказов данными адресов и магазинов
     orders_with_dims = orders_df \
         .join(addresses_df, orders_df.address_id == addresses_df.address_id, "left") \
         .join(stores_df, orders_df.store_id == stores_df.store_id, "left") \
@@ -55,13 +58,30 @@ def build_orders_mart(spark):
             stores_df.city.alias("store_city")
         )
 
-    order_items_with_totals = order_items_df \
-        .withColumn("item_total",
-                    col("quantity") * col("price") *
-                    (1 - coalesce(col("item_discount"), lit(0)) / 100)) \
-        .withColumn("order_item_turnover",
-                    col("item_total") * (1 - coalesce(col("order_discount_from_order"), lit(0)) / 100))
+    # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+    # Расчет выручки делаем через явный джойн с заказами, чтобы взять order_discount из fact_orders
+    # Убираем обращение к несуществующей колонке order_discount_from_order
+    
+    revenue_calc = order_items_df \
+        .join(
+            orders_with_dims.select("order_id", "order_status", "delivered_at", "address_city", "store_id", "store_name", "order_discount"),
+            on="order_id",
+            how="inner"
+        ) \
+        .filter(col("order_status") == "delivered") \
+        .withColumn("report_date", to_date(col("delivered_at"))) \
+        .withColumn("item_base_total", col("quantity") * col("price")) \
+        .withColumn("item_after_item_discount", 
+                    col("item_base_total") * (1 - coalesce(col("item_discount"), lit(0)) / 100)) \
+        .withColumn("final_revenue", 
+                    col("item_after_item_discount") * (1 - coalesce(col("order_discount"), lit(0)) / 100)) \
+        .groupBy("report_date", "address_city", "store_id", "store_name") \
+        .agg(
+            spark_sum("final_revenue").alias("revenue"),
+            spark_sum("final_revenue").alias("turnover") 
+        )
 
+    # Метрики по созданным заказам
     daily_metrics = orders_with_dims \
         .filter(col("created_at").isNotNull()) \
         .withColumn("report_date", to_date(col("created_at"))) \
@@ -71,37 +91,25 @@ def build_orders_mart(spark):
             countDistinct("user_id").alias("unique_customers_count")
         )
 
+    # Метрики по доставленным заказам
     delivered_metrics = orders_with_dims \
         .filter((col("delivered_at").isNotNull()) & (col("canceled_at").isNull())) \
         .withColumn("report_date", to_date(col("delivered_at"))) \
         .groupBy("report_date", "address_city", "store_id", "store_name") \
         .agg(count("*").alias("orders_delivered_count"))
 
+    # Метрики по отмененным заказам
     canceled_metrics = orders_with_dims \
         .filter(col("canceled_at").isNotNull()) \
         .withColumn("report_date", to_date(col("canceled_at"))) \
         .groupBy("report_date", "address_city", "store_id", "store_name") \
         .agg(
             count("*").alias("orders_canceled_count"),
-            sum(when(col("cancellation_reason").isin("Ошибка приложения", "Проблемы с оплатой"), 1).otherwise(0))
+            spark_sum(when(col("cancellation_reason").isin("Ошибка приложения", "Проблемы с оплатой"), 1).otherwise(0))
                 .alias("orders_canceled_service_error")
         )
 
-    revenue_calc = order_items_df \
-        .join(orders_with_dims.select("order_id", "order_status", "delivered_at", "address_city", "store_id", "store_name"),
-              "order_id") \
-        .filter(col("order_status") == "delivered") \
-        .withColumn("report_date", to_date(col("delivered_at"))) \
-        .withColumn("item_revenue",
-                    col("quantity") * col("price") *
-                    (1 - coalesce(col("item_discount"), lit(0)) / 100) *
-                    (1 - coalesce(col("order_discount"), lit(0)) / 100)) \
-        .groupBy("report_date", "address_city", "store_id", "store_name") \
-        .agg(
-            spark_sum("item_revenue").alias("revenue"),
-            spark_sum("item_revenue").alias("turnover") 
-        )
-
+    # Смена курьеров
     driver_changes = assignments_df \
         .join(orders_with_dims.select("order_id", "created_at", "address_city", "store_id", "store_name"), "order_id") \
         .withColumn("report_date", to_date(col("created_at"))) \
@@ -111,12 +119,14 @@ def build_orders_mart(spark):
         .groupBy("report_date", "address_city", "store_id", "store_name") \
         .agg(count("*").alias("driver_change_count"))
 
+    # Активные курьеры
     active_drivers = assignments_df \
         .join(orders_with_dims.select("order_id", "created_at", "address_city", "store_id", "store_name"), "order_id") \
         .withColumn("report_date", to_date(col("created_at"))) \
         .groupBy("report_date", "address_city", "store_id", "store_name") \
         .agg(countDistinct("driver_id").alias("active_drivers_count"))
 
+    # Сборка финального датафрейма
     mart_df = daily_metrics \
         .join(delivered_metrics, ["report_date", "address_city", "store_id", "store_name"], "left") \
         .join(canceled_metrics, ["report_date", "address_city", "store_id", "store_name"], "left") \
@@ -165,6 +175,7 @@ def build_orders_mart(spark):
 
 
 def build_products_mart(spark):
+    """Построение витрины товаров"""
 
     jdbc_url = f"jdbc:postgresql://{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
     properties = {
@@ -197,11 +208,13 @@ def build_products_mart(spark):
             orders_with_address.canceled_at,
             orders_with_address.order_status,
             items_df.item_title,
+            items_df.category_id.alias("category_id"),
             categories_df.category_name
         )
 
-        #МЕТРИКИ
+    # МЕТРИКИ
     product_metrics = order_items_full \
+        .filter(col("order_status") == "delivered") \
         .withColumn("report_date", to_date(coalesce(col("delivered_at"), col("created_at")))) \
         .withColumn("item_turnover",
                     col("quantity") * col("price") *
@@ -222,7 +235,6 @@ def build_products_mart(spark):
         .withColumn("month", month(col("report_date"))) \
         .withColumn("day", dayofmonth(col("report_date"))) \
         .withColumn("week", weekofyear(col("report_date")))
-
 
     window_day = Window.partitionBy("report_date", "city", "store_id").orderBy(desc("ordered_quantity"))
     window_day_asc = Window.partitionBy("report_date", "city", "store_id").orderBy(asc("ordered_quantity"))
@@ -264,7 +276,7 @@ def build_products_mart(spark):
 
 
 def write_mart_to_postgres(df, table_name, mode="overwrite"):
-
+    """Запись витрины в PostgreSQL"""
     jdbc_url = f"jdbc:postgresql://{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
     properties = {
         "user": DB_CONFIG['user'],
@@ -281,7 +293,7 @@ def write_mart_to_postgres(df, table_name, mode="overwrite"):
 
 
 def transform_and_build_marts(**kwargs):
-
+    """Основная функция запуска трансформации"""
     print("построениЕ витрин")
 
     spark = get_spark_session()
