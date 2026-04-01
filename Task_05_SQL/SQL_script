@@ -1,0 +1,51 @@
+SELECT * FROM ticket_flights;
+
+SELECT ticket_no, amount FROM ticket_flights WHERE fare_conditions = 'Business';
+
+SELECT airport_code FROM airports_data WHERE timezone = 'Europe/Moscow';
+
+SELECT * FROM flights WHERE flight_no = 'PG0216';
+
+SELECT * FROM flights WHERE departure_airport = 'DME' AND arrival_airport = 'LED';
+
+SELECT * FROM flights WHERE scheduled_departure >= '2017-02-10' AND scheduled_departure < '2017-04-11';
+
+SELECT model->>'en' AS model_en FROM aircrafts_data WHERE range < 5000;
+
+SELECT * FROM tickets ORDER BY passenger_name DESC LIMIT 100;
+
+SELECT ticket_no, passenger_name FROM tickets WHERE passenger_name = 'VIKTORIYA SMIRNOVA';
+
+SELECT passenger_name FROM tickets
+WHERE passenger_name LIKE '% NOV' OR passenger_name LIKE '% OVA'
+ORDER BY ticket_no, passenger_name DESC;
+	
+
+
+
+
+SELECT COUNT(*) AS aircraft_count FROM aircrafts_data;
+
+SELECT AVG(range) AS avg_range FROM aircrafts_data;
+
+SELECT MAX(range) AS max_range FROM aircrafts_data;
+
+SELECT COUNT(*) AS airport_count FROM airports_data;
+
+SELECT
+    AVG(total_amount) AS avg_amount,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_amount) AS median_amount,
+    (SELECT total_amount FROM bookings GROUP BY total_amount ORDER BY COUNT(*) DESC LIMIT 1) AS mode_amount
+FROM bookings;
+
+SELECT * FROM bookings ORDER BY total_amount DESC LIMIT 5;
+
+SELECT COUNT(*) AS boarding_pass_count FROM boarding_passes;
+
+SELECT SUM(amount) AS total_comfort_amount FROM ticket_flights WHERE fare_conditions = 'Comfort';
+
+SELECT
+    (SELECT * FROM flights ORDER BY scheduled_departure LIMIT 1) AS first_flight,
+    (SELECT * FROM flights ORDER BY scheduled_departure DESC LIMIT 1) AS last_flight;
+
+SELECT fare_conditions, AVG(amount) AS avg_amount FROM ticket_flights GROUP BY fare_conditions;
